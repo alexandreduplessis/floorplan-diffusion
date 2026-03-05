@@ -12,18 +12,19 @@ from pathlib import Path
 from PIL import Image
 from tqdm import tqdm
 
-# Room type colors used in condition images (RGB)
+# Room type colors (RGB) — from MSD constants.py
 ROOM_COLORS = {
-    "Balcony": (120, 190, 80),
-    "Kitchen": (240, 165, 60),
-    "Bedroom": (65, 105, 190),
-    "Stairs": (50, 130, 80),
-    "Corridor": (210, 180, 140),
-    "Storeroom": (70, 160, 160),
-    "Bathroom": (150, 100, 180),
-    "Living room": (210, 105, 50),
-    "Wall": (0, 0, 0),
-    "Background": (255, 255, 255),
+    "Bedroom":       (31, 119, 180),   # #1f77b4
+    "Livingroom":    (230, 85, 13),    # #e6550d
+    "Kitchen":       (253, 141, 60),   # #fd8d3c
+    "Dining":        (253, 174, 107),  # #fdae6b
+    "Corridor":      (253, 208, 162),  # #fdd0a2
+    "Stairs":        (114, 36, 108),   # #72246c
+    "Storeroom":     (82, 84, 163),    # #5254a3
+    "Bathroom":      (107, 110, 207),  # #6b6ecf
+    "Balcony":       (44, 160, 44),    # #2ca02c
+    "Structure":     (0, 0, 0),        # #000000
+    "Background":    (255, 255, 255),
 }
 
 # Build lookup array: shape (N, 3) for vectorized nearest-color matching

@@ -2,68 +2,69 @@
 """
 Preprocess the MSD dataset into condition/floor-plan image pairs.
 
+The MSD dataset stores floor plans as polygon geometries in a CSV file.
 This script:
-1. Color-segments floor plan images to identify rooms
-2. For each room, computes mask, bounding box, and inscribed circle
+1. Renders floor plan images from polygon data (512×512 RGB)
+2. For each room, computes bounding box and inscribed circle
 3. Randomly assigns each room a conditioning type (mask, bbox, circle, unconditioned)
-4. Builds condition images combining room conditions + optional global structure
-5. Creates two versions per floor plan (with/without global structure)
+4. Builds condition images combining room conditions + optional structure
+5. Creates two versions per floor plan (with/without structure)
 6. Splits into train/val/test and augments training data with 90/180 deg rotations
 
 Usage:
-    python data/preprocess.py --raw_dir data/msd_raw --output_dir data/msd_processed
+    python data/preprocess.py --csv_path data/msd_sample/mds_V2_5.372k.csv --output_dir data/msd_processed
 
-Paper reference: Section 4.1.1 of "Generating Multi-Occupancy Floor Plans with
-Latent Diffusion" (2025).
+    # Quick test with 10 floor plans:
+    python data/preprocess.py --csv_path data/msd_sample/mds_V2_5.372k.csv --output_dir data/msd_processed --max_plans 10
+
+Paper reference: Section 4.1.1 of "Generating accessible multi-occupancy
+floor plans with fine-grained control using a diffusion model" (2025).
 """
 
 import argparse
-import json
 import os
 import random
 import sys
-from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
-from PIL import Image, ImageDraw
-from shapely.geometry import MultiPolygon, Polygon
+from PIL import Image
+from shapely import wkt
+from shapely.geometry import Polygon, MultiPolygon
 from shapely.ops import unary_union
 from tqdm import tqdm
 
 # ---------------------------------------------------------------------------
-# MSD room-type color map (RGB).
-# These colors are derived from the MSD dataset conventions. The dataset uses
-# pixel-wise semantic color annotations with 13 room types.
-# Source: https://github.com/caspervanengelenburg/msd and paper figures.
+# MSD room-type color map (RGB) — from constants.py in the MSD repo.
+# Order matches ROOM_NAMES in the MSD codebase.
 # ---------------------------------------------------------------------------
 ROOM_COLORS: Dict[str, Tuple[int, int, int]] = {
-    "background":  (255, 255, 255),
-    "outdoor":     (200, 200, 200),
-    "wall":        (0,   0,   0),
-    "railing":     (100, 100, 100),
-    "door":        (140, 80,  50),
-    "stair":       (50,  130, 80),
-    "balcony":     (120, 190, 80),
-    "kitchen":     (240, 165, 60),
-    "bedroom":     (65,  105, 190),
-    "corridor":    (210, 180, 140),
-    "storeroom":   (70,  160, 160),
-    "bathroom":    (150, 100, 180),
-    "living_room": (210, 105, 50),
+    "Bedroom":       (31, 119, 180),   # #1f77b4
+    "Livingroom":    (230, 85, 13),    # #e6550d
+    "Kitchen":       (253, 141, 60),   # #fd8d3c
+    "Dining":        (253, 174, 107),  # #fdae6b
+    "Corridor":      (253, 208, 162),  # #fdd0a2
+    "Stairs":        (114, 36, 108),   # #72246c
+    "Storeroom":     (82, 84, 163),    # #5254a3
+    "Bathroom":      (107, 110, 207),  # #6b6ecf
+    "Balcony":       (44, 160, 44),    # #2ca02c
+    "Structure":     (0, 0, 0),        # #000000
+    "Door":          (255, 192, 0),    # #ffc000
+    "Entrance Door": (152, 223, 138),  # #98df8a
+    "Window":        (214, 39, 40),    # #d62728
 }
 
-# Structural / non-room colors that should not be treated as rooms
-NON_ROOM_LABELS = {"background", "outdoor", "wall", "railing", "door"}
+# Room types that appear in condition images (not structural elements)
+CONDITIONABLE_ROOMS = {
+    "Bedroom", "Livingroom", "Kitchen", "Dining", "Corridor",
+    "Stairs", "Storeroom", "Bathroom", "Balcony",
+}
 
-# Room labels eligible for conditioning
-ROOM_LABELS = sorted(set(ROOM_COLORS.keys()) - NON_ROOM_LABELS)
+# Structural elements (drawn as structure in floor plan, optionally in condition)
+STRUCTURAL_TYPES = {"Structure", "Door", "Entrance Door", "Window"}
 
-# Build reverse lookup: RGB tuple -> label
-COLOR_TO_LABEL: Dict[Tuple[int, int, int], str] = {v: k for k, v in ROOM_COLORS.items()}
-
-# Conditioning types
+# Conditioning types for each room
 COND_TYPES = ["mask", "bbox", "circle", "unconditioned"]
 
 # Target image size
@@ -79,214 +80,178 @@ SPLIT_TEST = 1600
 # Geometry helpers
 # ---------------------------------------------------------------------------
 
-def mask_to_polygon(mask: np.ndarray) -> Optional[Polygon]:
-    """Convert a binary mask to a Shapely Polygon (largest connected component)."""
-    contours, _ = cv2.findContours(
-        mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-    )
-    if not contours:
-        return None
-
-    polygons = []
-    for cnt in contours:
-        if len(cnt) >= 3:
-            pts = cnt.squeeze()
-            if pts.ndim == 2 and len(pts) >= 3:
-                poly = Polygon(pts)
-                if poly.is_valid and poly.area > 0:
-                    polygons.append(poly)
-
-    if not polygons:
-        return None
-
-    # Return the largest polygon
-    return max(polygons, key=lambda p: p.area)
+def polygon_to_pixel_coords(poly, minx, miny, scale, img_size):
+    """Convert a Shapely polygon's exterior coords to pixel coordinates."""
+    coords = np.array(poly.exterior.coords)
+    px = ((coords[:, 0] - minx) * scale).astype(np.int32)
+    py = (img_size - 1 - (coords[:, 1] - miny) * scale).astype(np.int32)  # flip Y
+    px = np.clip(px, 0, img_size - 1)
+    py = np.clip(py, 0, img_size - 1)
+    return np.stack([px, py], axis=1)
 
 
-def minimum_rotated_rectangle(poly: Polygon) -> np.ndarray:
-    """Return the corners of the minimum rotated bounding rectangle as Nx2 array."""
-    rect = poly.minimum_rotated_rectangle
-    coords = np.array(rect.exterior.coords[:-1])  # 4 corners
-    return coords
-
-
-def largest_inscribed_circle(poly: Polygon, tolerance: float = 1.0) -> Tuple[float, float, float]:
-    """
-    Approximate the largest inscribed circle using the distance transform on a
-    rasterized version of the polygon.
-
-    Returns (cx, cy, radius).
-    """
-    minx, miny, maxx, maxy = poly.bounds
-    w = int(maxx - minx) + 2
-    h = int(maxy - miny) + 2
-
-    if w < 3 or h < 3:
-        centroid = poly.centroid
-        return (centroid.x, centroid.y, 1.0)
-
-    # Rasterize polygon into a small mask
-    mask = np.zeros((h, w), dtype=np.uint8)
-    ext_coords = np.array(poly.exterior.coords)
-    shifted = ext_coords - np.array([minx, miny])
-    cv2.fillPoly(mask, [shifted.astype(np.int32)], 255)
-
+def largest_inscribed_circle(mask: np.ndarray) -> Tuple[int, int, float]:
+    """Find the largest inscribed circle center and radius from a binary mask."""
     dist = cv2.distanceTransform(mask, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
     _, max_val, _, max_loc = cv2.minMaxLoc(dist)
+    return (max_loc[0], max_loc[1], max(max_val, 1.0))
 
-    cx = max_loc[0] + minx
-    cy = max_loc[1] + miny
-    radius = max(max_val, 1.0)
 
-    return (cx, cy, radius)
+def minimum_rotated_rect_pixels(mask: np.ndarray) -> Optional[np.ndarray]:
+    """Get the minimum rotated rectangle corners from a binary mask."""
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    cnt = max(contours, key=cv2.contourArea)
+    if cv2.contourArea(cnt) < 10:
+        return None
+    rect = cv2.minAreaRect(cnt)
+    box = cv2.boxPoints(rect).astype(np.int32)
+    return box
 
 
 # ---------------------------------------------------------------------------
-# Room extraction
+# Rendering
 # ---------------------------------------------------------------------------
 
-def extract_rooms(
-    image: np.ndarray, color_tolerance: int = 10
-) -> List[Dict]:
+def render_floor_plan(plan_df, img_size=IMG_SIZE):
     """
-    Extract individual rooms from a floor plan image via color segmentation.
+    Render a floor plan from its polygon data to a 512×512 RGB image.
 
-    Each room dict contains:
-        - label: str (room type name)
-        - color: (R, G, B)
-        - mask: np.ndarray (H, W) binary mask
-        - polygon: Shapely Polygon
-        - area: float
+    Args:
+        plan_df: DataFrame rows for one plan_id
+        img_size: target image size
+
+    Returns:
+        image: (H, W, 3) uint8 RGB image
+        rooms: list of dicts with {label, color, mask, area, polygon_pixels}
+        structure_image: (H, W, 3) uint8 RGB image of structural elements only
+        minx, miny, scale: transform parameters
     """
-    h, w = image.shape[:2]
-    rooms = []
-    visited = np.zeros((h, w), dtype=bool)
-
-    for label in ROOM_LABELS:
-        color = np.array(ROOM_COLORS[label], dtype=np.uint8)
-
-        # Create a mask for pixels matching this color (with tolerance)
-        diff = np.abs(image.astype(np.int16) - color.astype(np.int16))
-        color_mask = np.all(diff <= color_tolerance, axis=2).astype(np.uint8)
-
-        # Exclude already-visited pixels (in case of color overlap with tolerance)
-        color_mask[visited] = 0
-
-        if color_mask.sum() < 50:  # skip tiny regions
+    # Parse all geometries
+    entities = []
+    for _, row in plan_df.iterrows():
+        try:
+            geom = wkt.loads(row["geom"])
+        except Exception:
             continue
+        room_type = row["roomtype"]
+        if room_type not in ROOM_COLORS:
+            continue
+        entities.append({"geom": geom, "room_type": room_type})
 
-        # Find connected components to separate individual rooms of the same type
-        num_labels, labels = cv2.connectedComponents(color_mask)
+    if not entities:
+        return None, [], None, 0, 0, 1
 
-        for comp_id in range(1, num_labels):
-            comp_mask = (labels == comp_id).astype(np.uint8)
-            area = comp_mask.sum()
+    # Compute bounding box of the entire floor plan
+    all_geoms = [e["geom"] for e in entities]
+    union = unary_union(all_geoms)
+    minx, miny, maxx, maxy = union.bounds
 
-            if area < 100:  # skip very small components (noise)
-                continue
+    # Add small padding
+    pad = max(maxx - minx, maxy - miny) * 0.02
+    minx -= pad
+    miny -= pad
+    maxx += pad
+    maxy += pad
 
-            poly = mask_to_polygon(comp_mask)
-            if poly is None:
-                continue
+    # Scale to fit in img_size
+    span_x = maxx - minx
+    span_y = maxy - miny
+    scale = (img_size - 1) / max(span_x, span_y)
 
-            visited[comp_mask > 0] = True
-            rooms.append({
-                "label": label,
-                "color": ROOM_COLORS[label],
-                "mask": comp_mask,
-                "polygon": poly,
-                "area": float(area),
-            })
+    # Render full floor plan image
+    fp_image = np.full((img_size, img_size, 3), 255, dtype=np.uint8)
+    structure_image = np.full((img_size, img_size, 3), 255, dtype=np.uint8)
 
-    return rooms
+    rooms = []
+
+    # Draw structural elements first (background layer)
+    for entity in entities:
+        if entity["room_type"] in STRUCTURAL_TYPES:
+            color = ROOM_COLORS[entity["room_type"]]
+            geom = entity["geom"]
+            polys = [geom] if geom.geom_type == "Polygon" else list(geom.geoms) if geom.geom_type == "MultiPolygon" else []
+            for poly in polys:
+                if not poly.is_valid or poly.is_empty:
+                    continue
+                pts = polygon_to_pixel_coords(poly, minx, miny, scale, img_size)
+                cv2.fillPoly(fp_image, [pts], color)
+                cv2.fillPoly(structure_image, [pts], color)
+
+    # Draw room areas on top
+    for entity in entities:
+        if entity["room_type"] in CONDITIONABLE_ROOMS:
+            color = ROOM_COLORS[entity["room_type"]]
+            geom = entity["geom"]
+            polys = [geom] if geom.geom_type == "Polygon" else list(geom.geoms) if geom.geom_type == "MultiPolygon" else []
+            for poly in polys:
+                if not poly.is_valid or poly.is_empty:
+                    continue
+                pts = polygon_to_pixel_coords(poly, minx, miny, scale, img_size)
+
+                # Create mask for this room
+                mask = np.zeros((img_size, img_size), dtype=np.uint8)
+                cv2.fillPoly(mask, [pts], 255)
+                area = mask.sum() / 255
+
+                if area < 50:  # skip tiny rooms
+                    continue
+
+                cv2.fillPoly(fp_image, [pts], color)
+
+                rooms.append({
+                    "label": entity["room_type"],
+                    "color": color,
+                    "mask": mask,
+                    "area": float(area),
+                })
+
+    return fp_image, rooms, structure_image, minx, miny, scale
 
 
-# ---------------------------------------------------------------------------
-# Condition image building
-# ---------------------------------------------------------------------------
-
-def assign_condition_types(
-    rooms: List[Dict], rng: random.Random
-) -> List[Dict]:
-    """Randomly assign a conditioning type to each room."""
-    for room in rooms:
-        room["cond_type"] = rng.choice(COND_TYPES)
-    return rooms
-
-
-def draw_filled_circle(draw: ImageDraw.ImageDraw, cx: float, cy: float, r: float, color: Tuple):
-    """Draw a filled circle on a PIL ImageDraw."""
-    draw.ellipse(
-        [cx - r, cy - r, cx + r, cy + r],
-        fill=color,
-    )
-
-
-def draw_filled_rotated_rect(
-    image: np.ndarray, corners: np.ndarray, color: Tuple
-):
-    """Draw a filled rotated rectangle on a numpy image using cv2."""
-    pts = corners.astype(np.int32).reshape((-1, 1, 2))
-    cv2.fillPoly(image, [pts], color=(color[2], color[1], color[0]))  # BGR for cv2
-
-
-def build_condition_image(
-    rooms: List[Dict],
-    structure_img: Optional[np.ndarray] = None,
-    img_size: int = IMG_SIZE,
-) -> np.ndarray:
+def build_condition_image(rooms, structure_img=None, img_size=IMG_SIZE):
     """
     Build a condition image from room conditions.
 
     Layering order (back to front):
         1. White background
-        2. Global structure (boundary/walls from structure_in) if provided
+        2. Global structure (boundary/walls) if provided
         3. Circles (largest area first)
         4. Bounding boxes (largest area first)
         5. Room masks (so they are fully visible on top)
 
     Unconditioned rooms are not drawn.
     """
-    # Start with white background
     cond = np.full((img_size, img_size, 3), 255, dtype=np.uint8)
 
     # Add global structure if provided
     if structure_img is not None:
-        struct_resized = cv2.resize(structure_img, (img_size, img_size), interpolation=cv2.INTER_NEAREST)
-        # Overlay structure: where structure is not white, replace background
-        non_white = np.any(struct_resized != 255, axis=2)
-        cond[non_white] = struct_resized[non_white]
+        non_white = np.any(structure_img != 255, axis=2)
+        cond[non_white] = structure_img[non_white]
 
     # Separate rooms by conditioning type
-    circle_rooms = [r for r in rooms if r["cond_type"] == "circle"]
-    bbox_rooms = [r for r in rooms if r["cond_type"] == "bbox"]
-    mask_rooms = [r for r in rooms if r["cond_type"] == "mask"]
+    circle_rooms = [r for r in rooms if r.get("cond_type") == "circle"]
+    bbox_rooms = [r for r in rooms if r.get("cond_type") == "bbox"]
+    mask_rooms = [r for r in rooms if r.get("cond_type") == "mask"]
 
-    # Sort by area (largest first) so smaller rooms appear on top
+    # Sort by area (largest first)
     circle_rooms.sort(key=lambda r: r["area"], reverse=True)
     bbox_rooms.sort(key=lambda r: r["area"], reverse=True)
     mask_rooms.sort(key=lambda r: r["area"], reverse=True)
 
     # Draw circles
     for room in circle_rooms:
-        cx, cy, radius = largest_inscribed_circle(room["polygon"])
+        cx, cy, radius = largest_inscribed_circle(room["mask"])
         color = room["color"]
-        cv2.circle(
-            cond,
-            (int(round(cx)), int(round(cy))),
-            int(round(radius)),
-            (color[0], color[1], color[2]),
-            thickness=-1,  # filled
-        )
+        cv2.circle(cond, (int(cx), int(cy)), int(radius), color, thickness=-1)
 
     # Draw bounding boxes (rotated rectangles)
     for room in bbox_rooms:
-        corners = minimum_rotated_rectangle(room["polygon"])
-        pts = corners.astype(np.int32).reshape((-1, 1, 2))
-        color = room["color"]
-        # cv2 uses BGR internally but we keep our image in RGB; fillPoly writes
-        # directly to the array so we pass RGB since our array is RGB.
-        cv2.fillPoly(cond, [pts], color=(int(color[0]), int(color[1]), int(color[2])))
+        box = minimum_rotated_rect_pixels(room["mask"])
+        if box is not None:
+            color = room["color"]
+            cv2.fillPoly(cond, [box], color)
 
     # Draw masks (on top)
     for room in mask_rooms:
@@ -302,14 +267,6 @@ def build_condition_image(
 # I/O helpers
 # ---------------------------------------------------------------------------
 
-def load_image_rgb(path: str, size: Optional[int] = None) -> np.ndarray:
-    """Load an image as RGB numpy array, optionally resizing."""
-    img = Image.open(path).convert("RGB")
-    if size is not None:
-        img = img.resize((size, size), Image.NEAREST)
-    return np.array(img)
-
-
 def save_image(arr: np.ndarray, path: str):
     """Save a numpy RGB array as a PNG image."""
     Image.fromarray(arr).save(path)
@@ -321,8 +278,6 @@ def rotate_image(arr: np.ndarray, angle: int) -> np.ndarray:
         return np.rot90(arr, k=1)
     elif angle == 180:
         return np.rot90(arr, k=2)
-    elif angle == 270:
-        return np.rot90(arr, k=3)
     return arr
 
 
@@ -330,237 +285,145 @@ def rotate_image(arr: np.ndarray, angle: int) -> np.ndarray:
 # Main preprocessing pipeline
 # ---------------------------------------------------------------------------
 
-def gather_samples(raw_dir: str) -> List[Dict]:
-    """
-    Gather all floor plan samples from the raw MSD dataset.
-
-    Returns a list of dicts with keys:
-        - floorplan_path: path to full_out image
-        - structure_path: path to structure_in image (may not exist for test)
-        - sample_id: identifier string
-        - split_source: 'train' or 'test'
-    """
-    samples = []
-    for split in ["train", "test"]:
-        fp_dir = Path(raw_dir) / split / "full_out"
-        struct_dir = Path(raw_dir) / split / "structure_in"
-
-        if not fp_dir.is_dir():
-            print(f"[WARNING] Directory not found: {fp_dir}")
-            continue
-
-        for fp_file in sorted(fp_dir.iterdir()):
-            if fp_file.suffix.lower() not in (".png", ".jpg", ".jpeg"):
-                continue
-
-            struct_file = struct_dir / fp_file.name
-            samples.append({
-                "floorplan_path": str(fp_file),
-                "structure_path": str(struct_file) if struct_file.exists() else None,
-                "sample_id": fp_file.stem,
-                "split_source": split,
-            })
-
-    return samples
-
-
-def process_sample(
-    sample: Dict,
-    rng: random.Random,
-    img_size: int = IMG_SIZE,
-    color_tolerance: int = 10,
-) -> List[Tuple[np.ndarray, np.ndarray]]:
-    """
-    Process a single sample into (condition, floorplan) pairs.
-
-    Returns a list of (condition_image, floorplan_image) tuples.
-    Two versions are produced:
-        1. Without global structure conditions
-        2. With global structure conditions (boundary from structure_in)
-    """
-    # Load floor plan image
-    fp_img = load_image_rgb(sample["floorplan_path"], size=img_size)
-
-    # Extract rooms
-    rooms = extract_rooms(fp_img, color_tolerance=color_tolerance)
-
-    if len(rooms) == 0:
-        # If no rooms found, still return the floor plan with a blank condition
-        blank_cond = np.full((img_size, img_size, 3), 255, dtype=np.uint8)
-        return [(blank_cond, fp_img)]
-
-    # Assign random conditioning types
-    rooms = assign_condition_types(rooms, rng)
-
-    results = []
-
-    # Version 1: without global structure
-    cond_no_struct = build_condition_image(rooms, structure_img=None, img_size=img_size)
-    results.append((cond_no_struct, fp_img))
-
-    # Version 2: with global structure (if available)
-    if sample["structure_path"] is not None and os.path.exists(sample["structure_path"]):
-        struct_img = load_image_rgb(sample["structure_path"], size=img_size)
-        cond_with_struct = build_condition_image(rooms, structure_img=struct_img, img_size=img_size)
-        results.append((cond_with_struct, fp_img))
-
-    return results
-
-
 def main():
     parser = argparse.ArgumentParser(
         description="Preprocess MSD dataset into condition/floorplan pairs."
     )
     parser.add_argument(
-        "--raw_dir", type=str, default="data/msd_raw",
-        help="Path to the raw MSD dataset directory (default: data/msd_raw)",
+        "--csv_path", type=str, default="data/msd_sample/mds_V2_5.372k.csv",
+        help="Path to MSD CSV file",
     )
     parser.add_argument(
         "--output_dir", type=str, default="data/msd_processed",
-        help="Output directory for processed pairs (default: data/msd_processed)",
+        help="Output directory for processed pairs",
     )
     parser.add_argument(
         "--img_size", type=int, default=IMG_SIZE,
         help=f"Target image size (default: {IMG_SIZE})",
     )
     parser.add_argument(
-        "--color_tolerance", type=int, default=10,
-        help="Tolerance for color matching during segmentation (default: 10)",
-    )
-    parser.add_argument(
         "--seed", type=int, default=42,
-        help="Random seed for reproducibility (default: 42)",
+        help="Random seed",
     )
     parser.add_argument(
-        "--n_train", type=int, default=SPLIT_TRAIN,
-        help=f"Number of training samples before augmentation (default: {SPLIT_TRAIN})",
-    )
-    parser.add_argument(
-        "--n_val", type=int, default=SPLIT_VAL,
-        help=f"Number of validation samples (default: {SPLIT_VAL})",
-    )
-    parser.add_argument(
-        "--n_test", type=int, default=SPLIT_TEST,
-        help=f"Number of test samples (default: {SPLIT_TEST})",
+        "--max_plans", type=int, default=None,
+        help="Max number of plans to process (for testing)",
     )
     parser.add_argument(
         "--no_augment", action="store_true",
-        help="Disable rotation augmentation for training data.",
+        help="Disable rotation augmentation",
     )
     args = parser.parse_args()
 
-    raw_dir = os.path.abspath(args.raw_dir)
-    output_dir = os.path.abspath(args.output_dir)
+    import pandas as pd
 
     rng = random.Random(args.seed)
     np.random.seed(args.seed)
 
     # -----------------------------------------------------------------------
-    # Step 1: Gather all samples
+    # Step 1: Load CSV
     # -----------------------------------------------------------------------
-    print("[INFO] Scanning raw dataset ...")
-    samples = gather_samples(raw_dir)
-    print(f"[INFO] Found {len(samples)} floor plan images.")
+    print(f"[INFO] Loading CSV: {args.csv_path}")
+    df = pd.read_csv(args.csv_path)
+    plan_ids = df["plan_id"].unique().tolist()
+    rng.shuffle(plan_ids)
+    print(f"[INFO] Found {len(plan_ids)} unique floor plans.")
 
-    if len(samples) == 0:
-        print("[ERROR] No samples found. Check --raw_dir path.")
-        sys.exit(1)
-
-    # Shuffle deterministically
-    rng.shuffle(samples)
+    if args.max_plans:
+        plan_ids = plan_ids[:args.max_plans]
+        print(f"[INFO] Limiting to {len(plan_ids)} plans.")
 
     # -----------------------------------------------------------------------
-    # Step 2: Split into train / val / test
+    # Step 2: Split
     # -----------------------------------------------------------------------
-    total_needed = args.n_train + args.n_val + args.n_test
-    if len(samples) < total_needed:
-        print(
-            f"[WARNING] Only {len(samples)} samples available, "
-            f"but {total_needed} requested (train={args.n_train}, val={args.n_val}, test={args.n_test}). "
-            f"Adjusting splits proportionally."
-        )
-        ratio = len(samples) / total_needed
-        n_train = int(args.n_train * ratio)
-        n_val = int(args.n_val * ratio)
-        n_test = len(samples) - n_train - n_val
+    n_total = len(plan_ids)
+    if n_total >= SPLIT_TRAIN + SPLIT_VAL + SPLIT_TEST:
+        n_train, n_val, n_test = SPLIT_TRAIN, SPLIT_VAL, SPLIT_TEST
     else:
-        n_train = args.n_train
-        n_val = args.n_val
-        n_test = args.n_test
+        # Proportional split for small datasets
+        ratio_train = SPLIT_TRAIN / (SPLIT_TRAIN + SPLIT_VAL + SPLIT_TEST)
+        ratio_val = SPLIT_VAL / (SPLIT_TRAIN + SPLIT_VAL + SPLIT_TEST)
+        n_train = int(n_total * ratio_train)
+        n_val = int(n_total * ratio_val)
+        n_test = n_total - n_train - n_val
 
-    train_samples = samples[:n_train]
-    val_samples = samples[n_train:n_train + n_val]
-    test_samples = samples[n_train + n_val:n_train + n_val + n_test]
-
-    print(f"[INFO] Split: train={len(train_samples)}, val={len(val_samples)}, test={len(test_samples)}")
+    splits = {
+        "train": plan_ids[:n_train],
+        "val": plan_ids[n_train:n_train + n_val],
+        "test": plan_ids[n_train + n_val:n_train + n_val + n_test],
+    }
+    print(f"[INFO] Split: train={len(splits['train'])}, val={len(splits['val'])}, test={len(splits['test'])}")
 
     # -----------------------------------------------------------------------
     # Step 3: Create output directories
     # -----------------------------------------------------------------------
     for split in ["train", "val", "test"]:
-        os.makedirs(os.path.join(output_dir, split, "conditions"), exist_ok=True)
-        os.makedirs(os.path.join(output_dir, split, "floor_plans"), exist_ok=True)
+        os.makedirs(os.path.join(args.output_dir, split, "conditions"), exist_ok=True)
+        os.makedirs(os.path.join(args.output_dir, split, "floor_plans"), exist_ok=True)
 
     # -----------------------------------------------------------------------
     # Step 4: Process each split
     # -----------------------------------------------------------------------
-    def process_split(
-        split_name: str,
-        split_samples: List[Dict],
-        augment: bool = False,
-    ):
-        """Process a dataset split and save condition/floorplan pairs."""
-        cond_dir = os.path.join(output_dir, split_name, "conditions")
-        fp_dir = os.path.join(output_dir, split_name, "floor_plans")
+    def process_split(split_name, split_plan_ids, augment=False):
+        cond_dir = os.path.join(args.output_dir, split_name, "conditions")
+        fp_dir = os.path.join(args.output_dir, split_name, "floor_plans")
         idx = 0
 
-        desc = f"Processing {split_name}"
-        for sample in tqdm(split_samples, desc=desc, unit="img"):
+        for plan_id in tqdm(split_plan_ids, desc=f"Processing {split_name}", unit="plan"):
+            plan_df = df[df["plan_id"] == plan_id]
+
             try:
-                pairs = process_sample(
-                    sample, rng,
-                    img_size=args.img_size,
-                    color_tolerance=args.color_tolerance,
-                )
+                fp_img, rooms, struct_img, _, _, _ = render_floor_plan(plan_df, args.img_size)
             except Exception as e:
-                print(f"\n[WARNING] Failed to process {sample['sample_id']}: {e}")
+                print(f"\n[WARNING] Failed to render plan {plan_id}: {e}")
                 continue
 
-            for cond_img, fp_img in pairs:
-                # Save original
-                fname = f"{idx:05d}.png"
-                save_image(cond_img, os.path.join(cond_dir, fname))
-                save_image(fp_img, os.path.join(fp_dir, fname))
-                idx += 1
+            if fp_img is None or len(rooms) == 0:
+                continue
 
-                # Augmentation: 90 and 180 degree rotations
-                if augment:
-                    for angle in [90, 180]:
-                        fname_aug = f"{idx:05d}.png"
+            # Assign random condition types
+            for room in rooms:
+                room["cond_type"] = rng.choice(COND_TYPES)
+
+            # Version 1: without structure
+            cond_no_struct = build_condition_image(rooms, structure_img=None, img_size=args.img_size)
+            save_image(cond_no_struct, os.path.join(cond_dir, f"{idx:05d}.png"))
+            save_image(fp_img, os.path.join(fp_dir, f"{idx:05d}.png"))
+            idx += 1
+
+            # Version 2: with structure
+            cond_with_struct = build_condition_image(rooms, structure_img=struct_img, img_size=args.img_size)
+            save_image(cond_with_struct, os.path.join(cond_dir, f"{idx:05d}.png"))
+            save_image(fp_img, os.path.join(fp_dir, f"{idx:05d}.png"))
+            idx += 1
+
+            # Augmentation
+            if augment:
+                for angle in [90, 180]:
+                    for cond_img in [cond_no_struct, cond_with_struct]:
                         cond_rot = rotate_image(cond_img, angle)
                         fp_rot = rotate_image(fp_img, angle)
-                        save_image(cond_rot, os.path.join(cond_dir, fname_aug))
-                        save_image(fp_rot, os.path.join(fp_dir, fname_aug))
+                        save_image(cond_rot, os.path.join(cond_dir, f"{idx:05d}.png"))
+                        save_image(fp_rot, os.path.join(fp_dir, f"{idx:05d}.png"))
                         idx += 1
 
         print(f"[INFO] {split_name}: saved {idx} pairs.")
         return idx
 
-    # Process train (with augmentation), val, test
     augment_train = not args.no_augment
-    n_train_total = process_split("train", train_samples, augment=augment_train)
-    n_val_total = process_split("val", val_samples, augment=False)
-    n_test_total = process_split("test", test_samples, augment=False)
+    n_train_total = process_split("train", splits["train"], augment=augment_train)
+    n_val_total = process_split("val", splits["val"], augment=False)
+    n_test_total = process_split("test", splits["test"], augment=False)
 
     # -----------------------------------------------------------------------
     # Summary
     # -----------------------------------------------------------------------
     print("\n" + "=" * 50)
     print("Preprocessing complete!")
-    print(f"  Train: {n_train_total} pairs" + (" (with 90/180 deg augmentation)" if augment_train else ""))
+    print(f"  Train: {n_train_total} pairs" + (" (with augmentation)" if augment_train else ""))
     print(f"  Val:   {n_val_total} pairs")
     print(f"  Test:  {n_test_total} pairs")
-    print(f"  Output: {output_dir}")
+    print(f"  Output: {args.output_dir}")
     print("=" * 50)
 
 
